@@ -7741,6 +7741,13 @@ impl Game<'_> {
         if effective == self.cursor_icon || !self.keyboard_mouse {
             return;
         }
+        // The host's dynamic mouse cursor, as SDL system cursor ids.
+        #[cfg(target_os = "android")]
+        crate::host_handoff::note_cursor(match effective {
+            Cursor::Arrow => 0,
+            Cursor::NotAllowed => 10,
+            Cursor::PointingHand => 11,
+        });
         if let Some(window) = &self.window {
             window.set_cursor(match effective {
                 Cursor::Arrow => winit::window::CursorIcon::Default,
@@ -16798,6 +16805,21 @@ impl Game<'_> {
                         self.right = false;
                         self.capture(false);
                     }
+                    #[cfg(target_os = "android")]
+                    if focused
+                        && crate::host_handoff::get().host_controls
+                        && self.player.is_some()
+                        && self.screen == Screen::Playing
+                        && self.title.is_none()
+                        && self.sign_edit.is_none()
+                        && self.book.is_none()
+                    {
+                        // DroidBridge temporarily focuses its transparent IME panel while the
+                        // Android keyboard is visible. Chat can close during that interval, but
+                        // `capture(true)` correctly refuses to grab an unfocused NativeActivity.
+                        // Restore vanilla gameplay capture as soon as the panel returns focus.
+                        self.capture(true);
+                    }
                 }
                 WindowEvent::CursorMoved { position, .. } => {
                     if let Some(r) = &self.renderer {
@@ -17557,9 +17579,16 @@ impl Game<'_> {
                     let elapsed = now.duration_since(self.previous);
                     self.frame_ticks = elapsed.as_secs_f32() * 20.0;
                     self.previous = now;
-                    // Arrow-key camera controls belong to gameplay; chat and
-                    // other screens use the same keys for their own navigation.
-                    if self.screen == Screen::Playing
+                    // Arrow-key camera controls belong to Horizon's standalone keypad/keyboard
+                    // path. DroidBridge owns controller/camera translation in embedded mode; an
+                    // Arrow key produced during an IME focus handoff must never become camera
+                    // movement after chat closes.
+                    #[cfg(target_os = "android")]
+                    let host_owns_camera = crate::host_handoff::get().host_controls;
+                    #[cfg(not(target_os = "android"))]
+                    let host_owns_camera = false;
+                    if !host_owns_camera
+                        && self.screen == Screen::Playing
                         && self.title.is_none()
                         && self.sign_edit.is_none()
                         && self.book.is_none()
@@ -17758,6 +17787,8 @@ impl Game<'_> {
                         horizon_client::crash::debug_crash_tick();
                         if self.fps_at.elapsed() >= Duration::from_secs(1) {
                             self.fps = self.fps_frames as f32 / self.fps_at.elapsed().as_secs_f32();
+                            #[cfg(target_os = "android")]
+                            crate::host_handoff::note_fps(self.fps);
                             self.fps_frames = 0;
                             self.fps_at = Instant::now();
                         }
@@ -19807,11 +19838,17 @@ fn write_report(game: &Game<'_>) -> Result<()> {
 
 fn exit_app(events: &dyn event_loop::EventLoopCtl) {
     #[cfg(target_os = "android")]
-    horizon_client::android_runtime::return_to_launcher();
+    {
+        horizon_client::android_runtime::return_to_launcher();
+        // DroidBridge embeds Horizon in its own Android process/task. End the event
+        // loop here so Launcher::exiting saves the world, then android_main reaches
+        // its existing embedded _exit(0) path and fully terminates :horizon.
+        if std::env::var_os("IRONBRIDGE_HORIZON_HOME").is_some() {
+            events.exit();
+        }
+    }
     #[cfg(not(target_os = "android"))]
     events.exit();
-    #[cfg(target_os = "android")]
-    let _ = events;
 }
 /// The window system ended the event loop with a failure (on Linux, a compositor dropping the
 /// connection after a protocol error) while fullscreen was on: the next start opens windowed, so a

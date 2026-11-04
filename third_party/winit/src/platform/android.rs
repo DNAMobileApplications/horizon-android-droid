@@ -250,6 +250,16 @@ pub fn native_pointer_device(id: crate::event::DeviceId) -> bool {
     crate::platform_impl::pointer_device(id.0.native_id())
 }
 
+/// Keyboard and mouse input from the host app's own views (IronBridge Launcher's touch
+/// controls, virtual mouse and controller mapper), emitted as normal window events.
+#[cfg(android_platform)]
+pub mod host_input {
+    pub use crate::platform_impl::host_input::{
+        enable, enabled, menu_cursor, push, set_menu_capture, set_pointer_grabbed, HostInput,
+        DEVICE_ID,
+    };
+}
+
 /// Current content origin in physical surface pixels.
 pub fn native_content_origin() -> [u32; 2] {
     crate::platform_impl::viewport::origin()

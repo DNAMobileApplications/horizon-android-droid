@@ -1,27 +1,39 @@
 plugins { id 'com.android.application' version '8.11.1' }
 
+def requestedAbi = providers.gradleProperty('abi').getOrElse('arm64-v8a')
+def horizonLocalDir = file('../../.local/android')
+def horizonJniDir = new File(horizonLocalDir, 'gradle-jni')
+def horizonAssetsDir = new File(horizonLocalDir, 'gradle-assets')
+def developmentKeystore = new File(horizonLocalDir, 'debug.keystore')
+
 android {
     namespace 'dev.horizon.android'
     compileSdk 35
+
     defaultConfig {
         applicationId providers.gradleProperty('appId').getOrElse('dev.horizon.android')
         minSdk providers.gradleProperty('minSdk').getOrElse('28').toInteger()
         targetSdk 35
         versionCode providers.gradleProperty('devVersionCode').getOrElse('29').toInteger()
         versionName '0.7.7' + (providers.gradleProperty('devVersionCode').isPresent() ? '-dev.' + providers.gradleProperty('devBuild').get() : '')
-        ndk { abiFilters providers.gradleProperty('abi').get() }
+        ndk { abiFilters requestedAbi }
     }
+
     signingConfigs {
         development {
-            storeFile file('../../.local/android/debug.keystore')
+            storeFile developmentKeystore
             storePassword 'android'
             keyAlias 'androiddebugkey'
             keyPassword 'android'
         }
     }
+
     buildTypes {
         debug {
-            signingConfig signingConfigs.development
+            // The upstream build creates .local/android/debug.keystore. When the
+            // source tree is opened directly in Android Studio, fall back to the
+            // normal Android debug key instead of failing configuration/build.
+            signingConfig developmentKeystore.isFile() ? signingConfigs.development : signingConfigs.debug
             versionNameSuffix '-dev.' + providers.gradleProperty('devBuild').getOrElse('local')
             if (!providers.gradleProperty('appId').isPresent()) { applicationIdSuffix '.dev' }
         }
@@ -29,18 +41,63 @@ android {
             debuggable false
             jniDebuggable false
             minifyEnabled false
-            // Retain the existing installation's signing identity for upgrades.
-            // Only the public certificate enters the APK; the key stays in .local/.
-            signingConfig signingConfigs.development
+            // Preserve the upstream signing identity when its local key exists.
+            // Otherwise leave release unsigned rather than failing every Gradle sync.
+            if (developmentKeystore.isFile()) { signingConfig signingConfigs.development }
         }
     }
+
     sourceSets.main {
         java.srcDirs = ['java']
         manifest.srcFile 'AndroidManifest.xml'
-        jniLibs.srcDirs = ['../../.local/android/gradle-jni']
-        assets.srcDirs = ['../../.local/android/gradle-assets']
+        // Keep the upstream generated locations, with local folders as a convenient
+        // fallback for Android Studio/manual development.
+        jniLibs.srcDirs = [horizonJniDir, file('jniLibs')]
+        assets.srcDirs = [horizonAssetsDir, file('assets')]
         res.srcDirs = ['res']
     }
-    packaging { jniLibs { useLegacyPackaging = true; keepDebugSymbols += '**/*.so' } }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+            keepDebugSymbols += '**/*.so'
+        }
+    }
 }
+
+// Keep upstream output layout so tools/android_build.py and Android Studio agree.
 layout.buildDirectory = file('../../.local/android/gradle-build')
+
+// A Java-only APK would install but crash immediately because HorizonActivity calls
+// System.loadLibrary("horizon_android"). Fail early with an actionable error instead.
+tasks.register('verifyHorizonNativeLibs') {
+    doLast {
+        def expectedName = 'libhorizon_android.so'
+        def candidates = [
+            new File(horizonJniDir, "${requestedAbi}/${expectedName}"),
+            file("jniLibs/${requestedAbi}/${expectedName}")
+        ]
+        if (!candidates.any { it.isFile() }) {
+            throw new GradleException(
+                "Missing ${expectedName} for ${requestedAbi}. " +
+                "Build the Rust/Android layer from the repository root first. " +
+                "On Windows you can run packaging\\android\\BUILD_ANDROID_WINDOWS.ps1. " +
+                "Expected output under ${horizonJniDir}."
+            )
+        }
+    }
+}
+
+tasks.named('preBuild').configure { dependsOn tasks.named('verifyHorizonNativeLibs') }
+
+tasks.register('diagnoseHorizonAndroid') {
+    doLast {
+        println "ABI: ${requestedAbi}"
+        println "Horizon local dir: ${horizonLocalDir}"
+        println "JNI dir: ${horizonJniDir}"
+        println "Assets dir: ${horizonAssetsDir}"
+        println "Development keystore: ${developmentKeystore} (${developmentKeystore.isFile() ? 'present' : 'missing; debug build will use Android default'})"
+        def nativeLib = new File(horizonJniDir, "${requestedAbi}/libhorizon_android.so")
+        println "Native library: ${nativeLib} (${nativeLib.isFile() ? 'present' : 'missing'})"
+    }
+}

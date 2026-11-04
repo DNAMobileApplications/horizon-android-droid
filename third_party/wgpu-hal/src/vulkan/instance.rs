@@ -190,6 +190,45 @@ impl super::InstanceShared {
     }
 }
 
+/// Horizon patch (see `[patch.crates-io]` in the root Cargo.toml): a host app that embeds Horizon on
+/// Android can hand over its own Vulkan loader, for example one bound to a Turnip or PanVK
+/// driver, as a `dlopen` handle in hex in `WGPU_VULKAN_LOADER_HANDLE`. Without it, or when the
+/// handle has no `vkGetInstanceProcAddr`, the system `libvulkan.so` is used as before.
+#[cfg(target_os = "android")]
+fn android_host_loader() -> Option<ash::Entry> {
+    let value = std::env::var("WGPU_VULKAN_LOADER_HANDLE").ok()?;
+    let value = value.trim();
+    let digits = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    let handle = usize::from_str_radix(digits, 16).ok()?;
+    if handle == 0 {
+        return None;
+    }
+    // SAFETY: the host passes a live dlopen handle that stays loaded for the process.
+    let symbol = unsafe {
+        libc::dlsym(
+            handle as *mut libc::c_void,
+            c"vkGetInstanceProcAddr".as_ptr(),
+        )
+    };
+    if symbol.is_null() {
+        log::warn!("WGPU_VULKAN_LOADER_HANDLE has no vkGetInstanceProcAddr; using libvulkan.so");
+        return None;
+    }
+    // SAFETY: vkGetInstanceProcAddr has exactly this signature.
+    let get_instance_proc_addr: vk::PFN_vkGetInstanceProcAddr =
+        unsafe { core::mem::transmute(symbol) };
+    log::info!("Vulkan: using the host's loader (handle {handle:#x})");
+    // SAFETY: a Vulkan loader's vkGetInstanceProcAddr, valid while the handle is loaded.
+    Some(unsafe {
+        ash::Entry::from_static_fn(ash::StaticFn {
+            get_instance_proc_addr,
+        })
+    })
+}
+
 impl super::Instance {
     pub fn shared_instance(&self) -> &super::InstanceShared {
         &self.shared
@@ -579,7 +618,12 @@ impl super::Instance {
             // a new release can happen.
             #[cfg(target_env = "ohos")]
             let loaded = ash::Entry::load_from("libvulkan.so");
-            #[cfg(not(target_env = "ohos"))]
+            #[cfg(target_os = "android")]
+            let loaded = match android_host_loader() {
+                Some(entry) => Ok(entry),
+                None => ash::Entry::load(),
+            };
+            #[cfg(not(any(target_env = "ohos", target_os = "android")))]
             let loaded = ash::Entry::load();
             loaded
         }

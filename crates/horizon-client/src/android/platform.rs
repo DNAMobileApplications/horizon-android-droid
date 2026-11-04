@@ -302,7 +302,9 @@ pub fn open_documents(id: &str) -> bool {
             .call_method(activity, "getPackageName", "()Ljava/lang/String;", &[])?
             .l()?;
         let package: String = env.get_string((&package).into())?.into();
-        let authority = JObject::from(env.new_string(format!("{package}.documents"))?);
+        let authority = JObject::from(
+            env.new_string(crate::host_handoff::get().documents_authority(&package))?,
+        );
         let document = JObject::from(env.new_string(id)?);
         let uri = env
             .call_static_method(
@@ -469,12 +471,27 @@ pub fn active() -> bool {
 
 pub fn finish() {
     with_context(|env, activity| {
-        env.call_method(activity, "finish", "()V", &[])?;
+        let method = if crate::host_handoff::get().embedded() {
+            "finishAndRemoveTask"
+        } else {
+            "finish"
+        };
+        env.call_method(activity, method, "()V", &[])?;
         Ok(())
     });
 }
 
+/// The game grabs or releases the pointer. With the host's controls, the grab is also
+/// reported to them and always succeeds: their touch camera needs no Android pointer capture.
 pub fn capture_mouse(capture: bool) -> bool {
+    let host_controls = crate::host_handoff::get().host_controls;
+    if host_controls {
+        crate::host_handoff::note_capture(capture);
+    }
+    request_pointer_capture(capture) || host_controls
+}
+
+fn request_pointer_capture(capture: bool) -> bool {
     if crate::native_ime::capture_mouse(capture) {
         return true;
     }
@@ -512,7 +529,20 @@ pub fn show_secret(text: &str) {
 pub fn show_multiline(text: &str) {
     show_editor(text, true);
 }
+pub fn show_chat(text: &str) {
+    show_editor(text, false);
+}
+
 fn show_editor(text: &str, multiline: bool) {
+    // Embedded DroidBridge owns every Android IME request. Horizon must never open its
+    // native editor while host controls are active; DroidBridge's Input/Keyboard action
+    // opens its existing hidden EditText and forwards the resulting text/keys through
+    // host_input_jni instead. This also prevents a second T press from spawning Horizon's
+    // keyboard on top of DroidBridge's controls.
+    if crate::host_handoff::get().host_controls {
+        EDIT.with(|e| *e.borrow_mut() = None);
+        return;
+    }
     MULTILINE.with(|mode| mode.set(multiline));
     if crate::native_ime::show(text) {
         EDIT.with(|e| *e.borrow_mut() = Some(text.into()));
@@ -522,10 +552,19 @@ fn show_editor(text: &str, multiline: bool) {
 }
 pub fn hide() {
     EDIT.with(|e| *e.borrow_mut() = None);
+    // In embedded mode Horizon must not touch InputMethodManager at all. Its hide call can
+    // otherwise dismiss DroidBridge's hidden EditText IME because both live in the same
+    // Activity. DroidBridge owns both showing and hiding the keyboard for this launch.
+    if crate::host_handoff::get().host_controls {
+        return;
+    }
     crate::native_ime::hide();
 }
 
 pub fn poll() -> Vec<Output> {
+    if crate::host_handoff::get().host_controls {
+        return vec![];
+    }
     EDIT.with(|edit| {
         let mut edit = edit.borrow_mut();
         let Some(old) = edit.as_mut() else {

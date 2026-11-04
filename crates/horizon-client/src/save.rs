@@ -132,16 +132,48 @@ pub fn dimension_dir(world: &Path, dimension: &str) -> PathBuf {
 }
 /// `DirectoryLock`: `session.lock` holds "\u{2603}" (UTF-16BE) under an exclusive
 /// file lock for as long as the world is open, so two instances cannot share it.
-pub struct SessionLock(fs::File);
+#[cfg(target_os = "android")]
+fn android_fallback_lock_path(world: &Path) -> Option<PathBuf> {
+    let lock_root = std::env::var_os("IRONBRIDGE_HORIZON_LOCK_DIR").map(PathBuf::from)?;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    world.to_string_lossy().hash(&mut hasher);
+    Some(lock_root.join(format!("{:016x}.lock", hasher.finish())))
+}
+
+#[cfg(target_os = "android")]
+fn android_uses_private_session_lock(world: &Path) -> bool {
+    // Android's emulated/shared storage is commonly backed by FUSE/sdcardfs semantics where
+    // flock(session.lock) can report EAGAIN even when no other Horizon process owns the world.
+    // Always coordinate these worlds through DroidBridge's app-private lock directory instead.
+    let path = world.to_string_lossy();
+    path.starts_with("/storage/emulated/")
+        || path.starts_with("/sdcard/")
+        || path.starts_with("/storage/self/primary/")
+}
+
+pub struct SessionLock {
+    file: fs::File,
+    /// Android shared/emulated storage can reject flock() on session.lock even when the
+    /// world is writable. In that case keep the actual kernel lock on an app-private file.
+    #[cfg(target_os = "android")]
+    fallback: Option<fs::File>,
+}
 impl Drop for SessionLock {
     /// `DirectoryLock.close`: release the lock, then close the file. Closing
     /// alone keeps the lock while any copy of the descriptor lives on, such as
     /// the one a process spawned on another thread holds until its `exec`.
     fn drop(&mut self) {
         #[cfg(not(target_os = "android"))]
-        let _ = self.0.unlock();
+        let _ = self.file.unlock();
         #[cfg(target_os = "android")]
-        let _ = rustix::fs::flock(&self.0, rustix::fs::FlockOperation::Unlock);
+        {
+            if let Some(fallback) = &self.fallback {
+                let _ = rustix::fs::flock(fallback, rustix::fs::FlockOperation::Unlock);
+            } else {
+                let _ = rustix::fs::flock(&self.file, rustix::fs::FlockOperation::Unlock);
+            }
+        }
     }
 }
 impl SessionLock {
@@ -153,19 +185,113 @@ impl SessionLock {
             .create(true)
             .truncate(false)
             .open(world.join("session.lock"))?;
-        // Rust 1.94's standard library returns Unsupported on Android without
-        // issuing a syscall (rust-lang/rust#148325). Keep the same kernel flock
-        // semantics through rustix rather than dropping the world's lock.
+
         #[cfg(target_os = "android")]
-        let locked = rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive);
+        let fallback = if android_uses_private_session_lock(world) {
+            let fallback_path = android_fallback_lock_path(world).ok_or_else(|| format!(
+                "cannot create private Android world lock for {}",
+                world.display()
+            ))?;
+            if let Some(lock_root) = fallback_path.parent() {
+                fs::create_dir_all(lock_root)?;
+            }
+            let mut fallback = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&fallback_path)?;
+            match rustix::fs::flock(
+                &fallback,
+                rustix::fs::FlockOperation::NonBlockingLockExclusive,
+            ) {
+                Ok(()) => {}
+                Err(error) if error == rustix::io::Errno::AGAIN => {
+                    return Err(format!(
+                        "{} is already open in another instance",
+                        world.display()
+                    )
+                    .into());
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "cannot lock private Android world lock for {}: {error}",
+                        world.display()
+                    )
+                    .into());
+                }
+            }
+            fallback.set_len(0)?;
+            fallback.write_all(world.to_string_lossy().as_bytes())?;
+            fallback.flush()?;
+            log::info!(
+                "Horizon: using private Android world lock {} for shared storage {}",
+                fallback_path.display(),
+                world.display()
+            );
+            Some(fallback)
+        } else {
+            match rustix::fs::flock(
+                &file,
+                rustix::fs::FlockOperation::NonBlockingLockExclusive,
+            ) {
+                Ok(()) => None,
+                Err(error) if error == rustix::io::Errno::AGAIN => {
+                    return Err(format!(
+                        "{} is already open in another instance",
+                        world.display()
+                    )
+                    .into());
+                }
+                Err(error) => {
+                    // Some Android filesystems may reject flock even outside the usual shared
+                    // storage mount. Fall back to the same app-private lock rather than disabling
+                    // the single-world safety check.
+                    let fallback_path = android_fallback_lock_path(world).ok_or_else(|| format!(
+                        "cannot lock {} on Android ({error})",
+                        world.display()
+                    ))?;
+                    if let Some(lock_root) = fallback_path.parent() {
+                        fs::create_dir_all(lock_root)?;
+                    }
+                    let mut fallback = fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(false)
+                        .open(&fallback_path)?;
+                    rustix::fs::flock(
+                        &fallback,
+                        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+                    )
+                    .map_err(|_| format!(
+                        "{} is already open in another instance",
+                        world.display()
+                    ))?;
+                    fallback.set_len(0)?;
+                    fallback.write_all(world.to_string_lossy().as_bytes())?;
+                    fallback.flush()?;
+                    log::warn!(
+                        "Horizon: session.lock flock failed ({error}); using private lock {}",
+                        fallback_path.display()
+                    );
+                    Some(fallback)
+                }
+            }
+        };
+
         #[cfg(not(target_os = "android"))]
-        let locked = file.try_lock();
-        locked.map_err(|_| format!("{} is already open in another instance", world.display()))?;
+        file.try_lock()
+            .map_err(|_| format!("{} is already open in another instance", world.display()))?;
+
         file.set_len(0)?;
         file.write_all(&[0x26, 0x03])?;
         file.flush()?;
-        Ok(Self(file))
+        Ok(Self {
+            file,
+            #[cfg(target_os = "android")]
+            fallback,
+        })
     }
+
     /// `DirectoryLock.isLocked`: another copy holds the world's `session.lock`.
     /// A world without the file is not locked; one whose file may not be opened
     /// is.
@@ -177,17 +303,102 @@ impl SessionLock {
             Ok(file) => file,
             Err(e) => return e.kind() == std::io::ErrorKind::PermissionDenied,
         };
-        match file.try_lock() {
-            Err(fs::TryLockError::WouldBlock) => true,
-            Err(_) => false,
-            // Take the probe's own lock back at once, as `SessionLock` does on drop.
-            Ok(()) => {
-                let _ = file.unlock();
-                false
+
+        #[cfg(target_os = "android")]
+        {
+            if android_uses_private_session_lock(world) {
+                let Some(path) = android_fallback_lock_path(world) else {
+                    return false;
+                };
+                let Some(parent) = path.parent() else {
+                    return false;
+                };
+                if fs::create_dir_all(parent).is_err() {
+                    return false;
+                }
+                let Ok(fallback) = fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(path)
+                else {
+                    return false;
+                };
+                return match rustix::fs::flock(
+                    &fallback,
+                    rustix::fs::FlockOperation::NonBlockingLockExclusive,
+                ) {
+                    Err(error) if error == rustix::io::Errno::AGAIN => true,
+                    Err(_) => false,
+                    Ok(()) => {
+                        let _ = rustix::fs::flock(
+                            &fallback,
+                            rustix::fs::FlockOperation::Unlock,
+                        );
+                        false
+                    }
+                };
+            }
+
+            match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+                Err(error) if error == rustix::io::Errno::AGAIN => true,
+                Err(_) => {
+                    // session.lock itself is on a filesystem without flock support. Probe the
+                    // same private lock used by acquire(); if another Horizon owns it, report
+                    // the world as locked without relying on the shared-storage filesystem.
+                    let Some(path) = android_fallback_lock_path(world) else {
+                        return false;
+                    };
+                    let Some(parent) = path.parent() else {
+                        return false;
+                    };
+                    if fs::create_dir_all(parent).is_err() {
+                        return false;
+                    }
+                    let Ok(fallback) = fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(false)
+                        .open(path)
+                    else {
+                        return false;
+                    };
+                    match rustix::fs::flock(
+                        &fallback,
+                        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+                    ) {
+                        Err(error) if error == rustix::io::Errno::AGAIN => true,
+                        Err(_) => false,
+                        Ok(()) => {
+                            let _ = rustix::fs::flock(
+                                &fallback,
+                                rustix::fs::FlockOperation::Unlock,
+                            );
+                            false
+                        }
+                    }
+                }
+                Ok(()) => {
+                    let _ = rustix::fs::flock(&file, rustix::fs::FlockOperation::Unlock);
+                    false
+                }
+            }
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            match file.try_lock() {
+                Err(fs::TryLockError::WouldBlock) => true,
+                Err(_) => false,
+                // Take the probe's own lock back at once, as `SessionLock` does on drop.
+                Ok(()) => {
+                    let _ = file.unlock();
+                    false
+                }
             }
         }
     }
 }
+
 /// Bring a world last saved by an older game version to the current format, as
 /// 26.3 does when it opens one: the file fixes and level.dat first
 /// (`FileFixerUpper`), then the DataFixers upgrades of every chunk, entity chunk,

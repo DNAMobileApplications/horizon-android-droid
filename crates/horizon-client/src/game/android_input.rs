@@ -22,7 +22,8 @@ impl Game<'_> {
         events: &dyn super::event_loop::EventLoopCtl,
         event: &winit::event::KeyEvent,
     ) -> Result<bool> {
-        if !self.pad_in_menu()
+        if crate::host_handoff::get().host_controls
+            || !self.pad_in_menu()
             || crate::platform::active()
             || self.ui.options.selected_key.is_some()
         {
@@ -73,7 +74,10 @@ impl Game<'_> {
         event: &WindowEvent,
     ) -> bool {
         const POINTER: u64 = u64::MAX - 2;
-        if !self.settings.keypad.enabled || (self.captured && crate::keyboard_mouse_input()) {
+        if crate::host_handoff::get().host_controls
+            || !self.settings.keypad.enabled
+            || (self.captured && crate::keyboard_mouse_input())
+        {
             return false;
         }
         let WindowEvent::MouseInput {
@@ -404,7 +408,13 @@ impl Game<'_> {
         Ok(false)
     }
     pub(super) fn android_show_keyboard(&mut self) {
-        // The in-world keyboard button needs a real editor to receive text.
+        // DroidBridge is the only IME owner for embedded Horizon. Never open Horizon's
+        // on-screen/system keyboard from T, /, a focused field, controller settings, or
+        // Horizon's own Keyboard action. The launcher Input/Keyboard action handles it.
+        if crate::host_handoff::get().host_controls {
+            return;
+        }
+        // The standalone in-world keyboard button needs a real editor to receive text.
         if !self.pad_in_menu() {
             self.open_chat("");
         }
@@ -461,6 +471,8 @@ impl Game<'_> {
             Some(super::books::BookScreen::Edit { signing: false, .. })
         ) {
             crate::platform::show_multiline(&initial);
+        } else if self.screen == Screen::Chat && self.title.is_none() {
+            crate::platform::show_chat(&initial);
         } else {
             crate::platform::show(&initial);
         }

@@ -13,6 +13,12 @@ import zipfile
 import json
 import hashlib
 import re
+import sys
+
+# Beside this script, also when Python was started without its folder on sys.path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import android_native_mods  # noqa: E402
+import android_notices  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGETS = {'x86_64': 'x86_64-linux-android', 'arm64-v8a': 'aarch64-linux-android',
@@ -20,12 +26,48 @@ TARGETS = {'x86_64': 'x86_64-linux-android', 'arm64-v8a': 'aarch64-linux-android
 
 
 def latest(directory):
-    return max(directory.iterdir(), key=lambda p: tuple(int(v) for v in p.name.split('.')))
+    candidates = [
+        p for p in directory.iterdir()
+        if p.is_dir() and all(v.isdigit() for v in p.name.split('.'))
+    ]
+    if not candidates:
+        raise RuntimeError(f'No stable numeric SDK versions found in {directory}')
+    return max(candidates, key=lambda p: tuple(int(v) for v in p.name.split('.')))
 
 
 def run(command, **kwargs):
     print(' '.join(map(str, command)), flush=True)
-    subprocess.run(list(map(str, command)), check=True, **kwargs)
+    command = list(map(str, command))
+    environment = kwargs.get('env')
+    if environment is not None and not os.path.dirname(command[0]):
+        # Windows looks a bare program name up on this process's PATH, not on the PATH
+        # passed to the child; resolve it on the child's PATH (which adds ~/.cargo/bin).
+        found = shutil.which(command[0], path=environment.get('PATH'))
+        if found:
+            command[0] = found
+    subprocess.run(command, check=True, **kwargs)
+
+
+def run_logged(command, cwd, env):
+    """Like run(), but also returns what the command printed (for naming a native mod that
+    failed to compile). Returns (exit code, output)."""
+    print(' '.join(map(str, command)), flush=True)
+    command = list(map(str, command))
+    found = shutil.which(command[0], path=env.get('PATH'))
+    if found:
+        command[0] = found
+    kept = []
+    size = 0
+    with subprocess.Popen(command, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          text=True, encoding='utf-8', errors='replace') as process:
+        for line in process.stdout:
+            sys.stdout.write(line)
+            kept.append(line)
+            size += len(line)
+            while size > 4 << 20 and kept:
+                size -= len(kept.pop(0))
+        sys.stdout.flush()
+    return process.returncode, ''.join(kept)
 
 
 def save_crash_symbols(library, stripped, abi, objcopy, revision):
@@ -110,6 +152,8 @@ def main():
     parser.add_argument('--gradle', type=Path, help='Gradle 8.14 executable (otherwise discover the cached distribution)')
     parser.add_argument('--check', action='store_true', help='Only type-check the Android target')
     parser.add_argument('--clippy', action='store_true', help='Run Android Clippy with warnings denied')
+    parser.add_argument('--host-libs', action='store_true', help='Build and stage only what a host app bundles (gradle-jni, gradle-assets), then stop: no standalone APK, so no Gradle 8.14')
+    parser.add_argument('--no-native-mods', action='store_true', help='Ignore native-mods/ (tools/android_native_mods.py) and build the plain engine')
     parser.add_argument('--bootstrap', type=Path, help=argparse.SUPPRESS)  # Old scripts: no longer used.
     args = parser.parse_args()
     if args.dev_build is not None:
@@ -146,8 +190,31 @@ def main():
     manifests = [(['-p', 'horizon-android'], features)]
     environment = dict(os.environ)
     environment['PATH'] = os.pathsep.join([str(ndk / 'bin'), str(args.java_home / 'bin'), environment['PATH']])
+    cargo_bin = Path.home() / '.cargo/bin'
+    if cargo_bin.is_dir():
+        # IDEs started before rustup was installed lack it on PATH.
+        environment['PATH'] = os.pathsep.join([environment['PATH'], str(cargo_bin)])
     environment['JAVA_HOME'] = str(args.java_home)
-    target_dir = Path(environment.get('CARGO_TARGET_DIR', ROOT / 'target')).resolve()
+    # Native mods (native-mods/*.hnmod) are applied to a staged copy of this source, which is
+    # compiled instead, into a target folder of its own so the plain build's stays as it is.
+    workspace, native_mods, native_bundles = ROOT, [], []
+    if not (args.check or args.clippy or args.skip_rust or args.no_native_mods):
+        workspace, native_mods, native_bundles = android_native_mods.prepare(environment, run, args.sdk)
+    # The engine lists these to DroidBridge's Horizon Add-ons screen (host_addons_jni.rs). Unset
+    # without native mods, so the plain build stays exactly as it was.
+    environment.pop('HORIZON_NATIVE_MODS_JSON', None)
+    environment.pop('HORIZON_NATIVE_MODS_REPORT', None)
+    if native_mods:
+        environment['HORIZON_NATIVE_MODS_JSON'] = json.dumps(native_mods, separators=(',', ':'))
+
+    def note_left_out():
+        # What the build left out reaches DroidBridge's add-ons screen, so the phone says why a
+        # mod isn't there. Unset when the build had no native mods to try.
+        if android_native_mods.REPORT:
+            environment['HORIZON_NATIVE_MODS_REPORT'] = android_native_mods.report_json()
+    note_left_out()
+    plain_target_dir = Path(environment.get('CARGO_TARGET_DIR', ROOT / 'target')).resolve()
+    target_dir = plain_target_dir / 'droidbridge-native' if workspace != ROOT else plain_target_dir
     environment['CARGO_TARGET_DIR'] = str(target_dir)
     triple = target.replace('-', '_')
     clang = ndk / 'bin' / (compiler_target + str(min_sdk) + '-clang' + ('.cmd' if os.name == 'nt' else ''))
@@ -169,7 +236,11 @@ def main():
         environment['HORIZON_ANDROID_BUILD_DIRTY'] = 'unknown'
     if args.release_candidate:
         flags = environment.get('CARGO_ENCODED_RUSTFLAGS', '').split('\x1f') if environment.get('CARGO_ENCODED_RUSTFLAGS') else environment.get('RUSTFLAGS', '').split()
-        for original, replacement in [(Path.home(), '/build'), (ROOT, '/horizon')]:
+        prefixes = [(Path.home(), '/build'), (ROOT, '/horizon')]
+        if workspace != ROOT:
+            # Only when native mods are staged: unchanged flags keep the plain build's cache.
+            prefixes.append((workspace, '/horizon'))
+        for original, replacement in prefixes:
             for prefix in dict.fromkeys([str(original), original.as_posix()]):
                 flags.append(f'--remap-path-prefix={prefix}={replacement}')
         environment['CARGO_ENCODED_RUSTFLAGS'] = '\x1f'.join(flags)
@@ -182,7 +253,62 @@ def main():
         return
     if not args.skip_rust:
         for selection, host_features in manifests:
-            run(['cargo', 'build', *selection, '--target', target, '--profile', args.profile, *host_features], cwd=ROOT, env=environment)
+            build = ['cargo', 'build', *selection, '--target', target, '--profile', args.profile, *host_features]
+            attempts = 0
+            while True:
+                if not native_mods:
+                    run(build, cwd=workspace, env=environment)
+                    break
+                code, printed = run_logged(build, cwd=workspace, env=environment)
+                if code == 0:
+                    break
+                names = ', '.join(f"{mod['id']} {mod['version']}" for mod in native_mods)
+                print(f'The engine did not compile with these native mods: {names}.', flush=True)
+                if os.environ.get('HORIZON_NATIVE_MODS_STRICT') == '1':
+                    raise subprocess.CalledProcessError(code, build)
+                culprits = android_native_mods.blame(printed, native_bundles, workspace)
+                if not culprits:
+                    # Can't tell which mod: DroidBridge's own patches are the likeliest cause, so
+                    # try once more with every patched mod built exactly as it ships.
+                    culprits = [mod for mod in native_bundles if mod.can_drop_patch()]
+                attempts += 1
+                if culprits and attempts <= 3:
+                    for mod in culprits:
+                        if mod.can_drop_patch():
+                            print(f'Native mods: {mod.describe()} did not compile with DroidBridge\'s on/off '
+                                  'toggle patch; building it again exactly as it ships', flush=True)
+                        else:
+                            android_native_mods.left_out(mod.id, mod.version,
+                                                         'it did not compile with this engine (see the build log)')
+                        android_native_mods.reject(mod, 'it did not compile with this engine')
+                    staged = workspace
+                    workspace, native_mods, native_bundles = android_native_mods.prepare(
+                        environment, run, args.sdk, exclude=android_native_mods.retry_exclusions(culprits))
+                    note_left_out()
+                    if native_mods:
+                        environment['HORIZON_NATIVE_MODS_JSON'] = json.dumps(native_mods, separators=(',', ':'))
+                        continue
+                    workspace = staged
+                else:
+                    for mod in native_bundles:
+                        android_native_mods.left_out(
+                            mod.id, mod.version, 'the engine did not compile with the native mods and the '
+                            'build could not tell which one failed (the PC build log has the error)')
+                # Keep the app building: the plain engine, from its own unchanged cache.
+                print('Building the engine without native mods instead '
+                      '(set HORIZON_NATIVE_MODS_STRICT=1 to stop the build here).', flush=True)
+                staged = {str(workspace), workspace.as_posix()}
+                if environment.get('CARGO_ENCODED_RUSTFLAGS'):
+                    environment['CARGO_ENCODED_RUSTFLAGS'] = '\x1f'.join(
+                        flag for flag in environment['CARGO_ENCODED_RUSTFLAGS'].split('\x1f')
+                        if not any(flag.startswith(f'--remap-path-prefix={prefix}=') for prefix in staged))
+                workspace, native_mods, native_bundles = ROOT, [], []
+                environment.pop('HORIZON_NATIVE_MODS_JSON', None)
+                note_left_out()
+                target_dir = plain_target_dir
+                environment['CARGO_TARGET_DIR'] = str(target_dir)
+                run(build, cwd=ROOT, env=environment)
+                break
     if args.rust_only:
         return
     output = ROOT / '.local/android/apk' / args.abi
@@ -194,16 +320,31 @@ def main():
         library = target_dir / target / ('debug' if args.profile == 'dev' else args.profile) / name
         if not library.is_file():
             raise FileNotFoundError(library)
+        # A host build runs on every app build: skip the copy, strip and symbols when
+        # cargo left the library as it was, so the host's packaging stays up to date.
+        source = library.stat()
+        stamp_file = staging / (name + '.source')
+        stamp = f'{args.profile}:{source.st_size}:{source.st_mtime_ns}'
+        if args.host_libs and (staging / name).is_file() and stamp_file.is_file() and stamp_file.read_text() == stamp:
+            print(f'Unchanged: {staging / name}', flush=True)
+            continue
+        stamp_file.unlink(missing_ok=True)
         shutil.copyfile(library, staging / name)
         run([ndk / 'bin' / ('llvm-strip' + suffix), '--strip-unneeded', staging / name])
         if args.profile == 'release':
             save_crash_symbols(library, staging / name, args.abi,
                                ndk / 'bin' / ('llvm-objcopy' + suffix),
                                environment.get('HORIZON_ANDROID_BUILD_COMMIT', 'unknown'))
+        stamp_file.write_text(stamp)
     assets = ROOT / '.local/android/gradle-assets'
     assets.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(ROOT / 'LICENSE', assets / 'LICENSE.txt')
-    shutil.copyfile(ROOT / 'THIRD_PARTY_NOTICES.md', assets / 'THIRD_PARTY_NOTICES.md')
+    # One notices file for the host app's open-source licenses page: Horizon's license and
+    # notices, the native mods built in, and every Rust library compiled into the engine.
+    if native_bundles:
+        android_native_mods.ensure_registry_index()
+    android_notices.write(assets / 'THIRD_PARTY_NOTICES.md', ROOT, workspace, environment, target,
+                          native_bundles, android_native_mods.WORK)
     shutil.copyfile(engine_data(args.public), assets / 'engine-data.zip')
     controls = ROOT / '.local/android/bedrock-controls.zip'
     if not args.public and not controls.is_file():
@@ -213,6 +354,9 @@ def main():
         (assets / 'bedrock-controls.zip').unlink(missing_ok=True)
     else:
         shutil.copyfile(controls, assets / 'bedrock-controls.zip')
+    if args.host_libs:
+        print(f'Engine for the host app: {staging / "libhorizon_android.so"} and {assets / "engine-data.zip"}', flush=True)
+        return
     key = ROOT / '.local/android/debug.keystore'
     if not key.exists():
         run([args.java_home / 'bin' / ('keytool' + suffix), '-genkeypair', '-keystore', key, '-storepass', 'android', '-keypass', 'android', '-alias', 'androiddebugkey', '-keyalg', 'RSA', '-validity', '3650', '-dname', 'CN=Horizon Android Development'])
